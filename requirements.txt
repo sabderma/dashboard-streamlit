@@ -1,5 +1,5 @@
 streamlit
 pandas
-plotly
 pyarrow
-streamlit-plotly-events
+requests
+plotly

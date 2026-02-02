@@ -1,56 +1,110 @@
+import os
+import requests
+
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
 
-
+# =========================
+# CONFIG
+# =========================
 st.set_page_config(page_title="Dashboard — Redevabilité Catégories", layout="wide")
 st.title("Dashboard — Redevabilité (Catégories)")
 
-# -------------------------------------------------malek----
-@st.cache_data
-def load_data():
-    df = pd.read_parquet("gd_redevabilite_enrichi.parquet")
+PARQUET_URL = "https://huggingface.co/datasets/sabderma/dashboard-streamlit-data/resolve/main/gd_redevabilite_enrichi.parquet"
+LOCAL_PARQUET = "gd_redevabilite_enrichi.parquet"
 
-    # Dates
-    df["mois_annee"] = pd.to_datetime(df["mois_annee"], errors="coerce")
+COL_CAT = "CATEGORIE_LIBELLE_2"
+COL_SSCAT = "CATEGORIE_LIBELLE_SSCAT"
+COL_DATE = "mois_annee"
+COL_PRESENCE = "presence_type_coord_03"
 
-    # Mois pré-calculé (plus rapide)
-    df["mois"] = df["mois_annee"].dt.to_period("M").dt.to_timestamp()
 
-    # Colonnes catégorielles utiles uniquement
-    for col in ["CATEGORIE_LIBELLE_2", "CATEGORIE_LIBELLE_SSCAT"]:
+# =========================
+# DATA LOADER (download + cache)
+# =========================
+@st.cache_data(show_spinner=True)
+def _download_file(url: str, local_path: str) -> str:
+    """Download once (cached by Streamlit)."""
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        return local_path
+
+    with st.spinner("Téléchargement du fichier parquet (premier lancement)…"):
+        r = requests.get(url, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
+                if chunk:
+                    f.write(chunk)
+    return local_path
+
+
+@st.cache_data(show_spinner=True)
+def load_data() -> pd.DataFrame:
+    path = _download_file(PARQUET_URL, LOCAL_PARQUET)
+
+    # Lecture parquet
+    df = pd.read_parquet(path)
+
+    # Sécuriser colonnes attendues
+    if COL_DATE in df.columns:
+        df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+        df["mois"] = df[COL_DATE].dt.to_period("M").dt.to_timestamp()
+    else:
+        df["mois"] = pd.NaT
+
+    # présence_type_coord_03 => 0/1 int
+    if COL_PRESENCE in df.columns:
+        df[COL_PRESENCE] = pd.to_numeric(df[COL_PRESENCE], errors="coerce").fillna(0).astype(int)
+    else:
+        df[COL_PRESENCE] = 0
+
+    # Categorical (perf)
+    for col in [COL_CAT, COL_SSCAT]:
         if col in df.columns:
             df[col] = df[col].astype("category")
+        else:
+            df[col] = pd.Series(["Inconnu"] * len(df), dtype="category")
 
     return df
 
+
 df = load_data()
 
-# -------------------------------------------------
-# Sidebar filtres
-# -------------------------------------------------
+
+# =========================
+# SIDEBAR FILTERS
+# =========================
 st.sidebar.header("Filtres")
 
 # Période
-mois_min = df["mois"].min()
-mois_max = df["mois"].max()
+if df["mois"].notna().any():
+    mois_min = df["mois"].min()
+    mois_max = df["mois"].max()
 
+    liste_mois = pd.date_range(mois_min, mois_max, freq="MS")
+    if len(liste_mois) == 0:
+        liste_mois = pd.date_range(pd.Timestamp.today().normalize(), periods=1, freq="MS")
 
-liste_mois = pd.date_range(mois_min, mois_max, freq="MS")  
-
-mois_range = st.sidebar.select_slider(
-    "Période (mois)",
-    options=liste_mois,
-    value=(liste_mois[0], liste_mois[-1]),
-    format_func=lambda d: d.strftime("%Y-%m")
-)
-
+    mois_range = st.sidebar.select_slider(
+        "Période (mois)",
+        options=liste_mois,
+        value=(liste_mois[0], liste_mois[-1]),
+        format_func=lambda d: d.strftime("%Y-%m")
+    )
+else:
+    st.sidebar.warning("Colonne de date indisponible : filtre période désactivé.")
+    mois_range = None
 
 # Catégorie
-cat_options = sorted(df["CATEGORIE_LIBELLE_2"].dropna().unique())
+cat_options = sorted(pd.Series(df[COL_CAT]).dropna().astype(str).unique().tolist())
+if len(cat_options) == 0:
+    cat_options = ["Inconnu"]
+
 cat_filter = st.sidebar.multiselect(
-    "Catégorie (CATEGORIE_LIBELLE_2)",
+    f"Catégorie ({COL_CAT})",
     options=cat_options,
     default=cat_options
 )
@@ -59,84 +113,70 @@ st.sidebar.divider()
 st.sidebar.subheader("Détail par sous-catégorie")
 
 cat_detail = st.sidebar.selectbox(
-    "Choisir une catégorie (CATEGORIE_LIBELLE_2)",
+    f"Choisir une catégorie ({COL_CAT})",
     options=["(Toutes)"] + cat_options
 )
 
-
 st.sidebar.divider()
-st.sidebar.subheader("pie chart")
+st.sidebar.subheader("Pie chart")
+
 cat_detail_pie = st.sidebar.selectbox(
     "Choisir une catégorie pour le pie chart",
-    options=["il faut choisir une categorie"] + cat_options,
+    options=["(Choisir)"] + cat_options,
     key="cat_pie"
 )
 
-# -------------------------------------------------
-# Filtrage  (mask)
-# -------------------------------------------------
+
+# =========================
+# FILTERING
+# =========================
 mask = pd.Series(True, index=df.index)
 
-start_mois, end_mois = mois_range
-mask &= df["mois"].between(start_mois, end_mois)
+if mois_range is not None:
+    start_mois, end_mois = mois_range
+    mask &= df["mois"].between(start_mois, end_mois)
 
 if cat_filter:
-    mask &= df["CATEGORIE_LIBELLE_2"].isin(cat_filter)
+    mask &= df[COL_CAT].astype(str).isin([str(x) for x in cat_filter])
 
-filtered = df.loc[mask]
+filtered = df.loc[mask].copy()
 
 
-# -------------------------------------------------
-# KPI 
-# -------------------------------------------------
-k1, k2, k3, k4 ,k5 =st.columns(5)    
+# =========================
+# KPI
+# =========================
+k1, k2, k3, k4, k5 = st.columns(5)
 
 k1.metric("Total lignes (global)", f"{len(df):,}".replace(",", " "))
-k2.metric("Nb catégories (global)", df["CATEGORIE_LIBELLE_2"].nunique(dropna=True))
-k3.metric("Nb sous-catégories (global)", df["CATEGORIE_LIBELLE_SSCAT"].nunique(dropna=True))
-k4.metric("Nb mois (global)", df["mois"].nunique())
-
-k5.metric(
-    "Nb avec type coordonnée 03 (OUI)",
-    int(df["presence_type_coord_03"].fillna(0).sum())
-)
+k2.metric("Nb catégories (global)", int(df[COL_CAT].nunique(dropna=True)))
+k3.metric("Nb sous-catégories (global)", int(df[COL_SSCAT].nunique(dropna=True)))
+k4.metric("Nb mois (global)", int(df["mois"].nunique(dropna=True)))
+k5.metric("Nb avec type coordonnée 03 (OUI)", int(df[COL_PRESENCE].sum()))
 
 st.divider()
-
-st.info(" OUI : la redevabilité possède au moins une coordonnée de type 03 (adresse e-mail).")
-st.info( "NON : la redevabilité ne possède aucune coordonnée de type 03 (adresse e-mail).")
-
+st.info("✅ OUI : la redevabilité possède au moins une coordonnée de type 03 (adresse e-mail).")
+st.info("❌ NON : la redevabilité ne possède aucune coordonnée de type 03 (adresse e-mail).")
 st.divider()
 
-# -------------------------------------------------
-# Graph 1 : Catégories triées + Total au-dessus + % OUI dans la barre OUI
-# -------------------------------------------------
-COL_PRESENCE = "presence_type_coord_03"  # <-- adapte si besoin
 
+# =========================
+# GRAPH 1 — Stacked bars + totals + % inside OUI
+# =========================
 tmp = filtered.copy()
 
-# Sécuriser en 0/1
-tmp[COL_PRESENCE] = pd.to_numeric(tmp[COL_PRESENCE], errors="coerce").fillna(0).astype(int)
-
-# Agrégation par catégorie
 agg = (
-    tmp.groupby("CATEGORIE_LIBELLE_2")[COL_PRESENCE]
+    tmp.groupby(COL_CAT)[COL_PRESENCE]
     .agg(total="size", oui="sum")
     .reset_index()
 )
-agg["non"] = agg["total"] - agg["oui"]
-agg["Catégorie"] = agg["CATEGORIE_LIBELLE_2"].astype(str).replace("nan", "Inconnu")
 
-# Trier barres du + grand au + petit (total)
+agg["non"] = agg["total"] - agg["oui"]
+agg["Catégorie"] = agg[COL_CAT].astype(str).replace("nan", "Inconnu")
 agg = agg.sort_values("total", ascending=False)
 
-# % OUI
 agg["pct_oui"] = (agg["oui"] / agg["total"] * 100).round(1).fillna(0)
-
-# Labels
 agg["label_total"] = agg["total"].astype(int).astype(str)
 
-# Long format pour stacked
 long_df = agg.melt(
     id_vars=["Catégorie", "total", "pct_oui", "label_total"],
     value_vars=["non", "oui"],
@@ -145,17 +185,13 @@ long_df = agg.melt(
 )
 long_df["Présence type 03"] = long_df["Présence type 03"].map({"oui": "OUI", "non": "NON"})
 
-# Texte à l’intérieur : % seulement sur OUI
 long_df["text_in"] = long_df.apply(
     lambda r: f"{r['pct_oui']}%" if r["Présence type 03"] == "OUI" else "",
     axis=1
 )
 
-import plotly.graph_objects as go
-
 fig1 = go.Figure()
 
-# NON
 df_non = long_df[long_df["Présence type 03"] == "NON"]
 fig1.add_trace(go.Bar(
     x=df_non["Catégorie"],
@@ -165,7 +201,6 @@ fig1.add_trace(go.Bar(
     textposition="inside"
 ))
 
-# OUI (% à l'intérieur)
 df_oui = long_df[long_df["Présence type 03"] == "OUI"]
 fig1.add_trace(go.Bar(
     x=df_oui["Catégorie"],
@@ -175,12 +210,11 @@ fig1.add_trace(go.Bar(
     textposition="inside"
 ))
 
-# Total au-dessus (extérieur)
 fig1.add_trace(go.Scatter(
     x=agg["Catégorie"],
     y=agg["total"],
     mode="text",
-    text=agg["label_total"],     
+    text=agg["label_total"],
     textposition="top center",
     showlegend=False
 ))
@@ -203,21 +237,22 @@ fig1.update_layout(
 st.plotly_chart(fig1, use_container_width=True)
 
 
-# -------------------------------------------------
-# Graph 2 : Drill-down sous-catégories
-# -------------------------------------------------
+# =========================
+# GRAPH 2 — Drill-down sous-catégories (top 10)
+# =========================
 detail_df = filtered
 if cat_detail != "(Toutes)":
-    detail_df = detail_df[detail_df["CATEGORIE_LIBELLE_2"] == cat_detail]
+    detail_df = detail_df[detail_df[COL_CAT].astype(str) == str(cat_detail)]
 
 sscat_count = (
-    detail_df["CATEGORIE_LIBELLE_SSCAT"]
+    detail_df[COL_SSCAT]
+    .astype(str)
+    .fillna("Inconnu")
     .value_counts(dropna=False)
     .head(10)
     .reset_index()
 )
 sscat_count.columns = ["Sous-catégorie", "Nombre"]
-sscat_count["Sous-catégorie"] = sscat_count["Sous-catégorie"].astype(str).replace("nan", "Inconnu")
 
 title_cat = cat_detail if cat_detail != "(Toutes)" else "Toutes catégories"
 
@@ -229,7 +264,6 @@ fig2 = px.bar(
     text="Nombre",
     title=f"Sous-catégories — {title_cat} (filtré)"
 )
-
 fig2.update_traces(textposition="outside")
 fig2.update_layout(
     xaxis_title="Nombre de lignes",
@@ -237,31 +271,21 @@ fig2.update_layout(
     uniformtext_minsize=10,
     uniformtext_mode="hide"
 )
-
 st.plotly_chart(fig2, use_container_width=True)
 
 
-# -------------------------------------------------
-# Graph 3 : pie chart (OUI vs NON) pour UNE catégorie
-# -------------------------------------------------
-
-COL_PRESENCE = "presence_type_coord_03"
-
-if cat_detail_pie == "il faut choisir une categorie":
-    st.info(" Choisis une catégorie dans le filtre 'pie chart' pour afficher le graphique.")
+# =========================
+# GRAPH 3 — Pie chart OUI/NON pour une catégorie
+# =========================
+if cat_detail_pie == "(Choisir)":
+    st.info("Choisis une catégorie dans le filtre 'Pie chart' pour afficher le graphique.")
 else:
-    pie_df = filtered[filtered["CATEGORIE_LIBELLE_2"] == cat_detail_pie].copy()
+    pie_df = filtered[filtered[COL_CAT].astype(str) == str(cat_detail_pie)].copy()
 
-    # Sécuriser presence en 0/1
-    pie_df[COL_PRESENCE] = pd.to_numeric(pie_df[COL_PRESENCE], errors="coerce").fillna(0).astype(int)
- 
-
- 
-    # Compter OUI/NON
     pie_counts = (
         pie_df[COL_PRESENCE]
         .value_counts()
-        .reindex([1, 0], fill_value=0)   
+        .reindex([1, 0], fill_value=0)
         .reset_index()
     )
     pie_counts.columns = ["Présence type 03", "Nombre"]
@@ -273,10 +297,7 @@ else:
         values="Nombre",
         title=f"Présence type coordonnée 03 — {cat_detail_pie} (filtré)"
     )
-
     fig3.update_traces(textinfo="percent+label", pull=[0.02, 0.02])
-    fig3.update_layout(
-        legend_title="Type coordonnée 03"
-    )
+    fig3.update_layout(legend_title="Type coordonnée 03")
 
     st.plotly_chart(fig3, use_container_width=True)
