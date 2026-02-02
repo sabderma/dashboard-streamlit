@@ -1,77 +1,85 @@
+import os
+import requests
 
+import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
 
-import os
-import requests
-import pandas as pd
-
+# =========================
+# Render config
+# =========================
+st.set_page_config(page_title="Dashboard — Redevabilité Catégories", layout="wide")
+st.title("Dashboard — Redevabilité (Catégories)")
 
 PARQUET_URL = "https://huggingface.co/datasets/sabderma/dashboard-streamlit-data/resolve/main/gd_redevabilite_enrichi.parquet"
-LOCAL_PARQUET = "/tmp/gd_redevabilite_enrichi.parquet"  # important sur Streamlit Cloud
 
-NEEDED_COLS = [
-    "mois_annee",
-    "CATEGORIE_LIBELLE_2",
-    "CATEGORIE_LIBELLE_SSCAT",
-    "presence_type_coord_03",
-]
+# Render: on stocke dans un dossier persistant (à monter sur Render)
+DATA_DIR = os.environ.get("DATA_DIR", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
+LOCAL_PARQUET = os.path.join(DATA_DIR, "gd_redevabilite_enrichi.parquet")
+
+# Colonnes utilisées par ton dashboard
+COL_CAT = "CATEGORIE_LIBELLE_2"
+COL_SSCAT = "CATEGORIE_LIBELLE_SSCAT"
+COL_DATE = "mois_annee"
+COL_PRESENCE = "presence_type_coord_03"
+
+NEEDED_COLS = [COL_DATE, COL_CAT, COL_SSCAT, COL_PRESENCE]
+
+
+# =========================
+# Download + Load
+# =========================
 @st.cache_data(show_spinner=True)
-def download_parquet() -> str:
-    # si déjà téléchargé
-    if os.path.exists(LOCAL_PARQUET) and os.path.getsize(LOCAL_PARQUET) > 0:
-        return LOCAL_PARQUET
+def download_parquet(url: str, local_path: str) -> str:
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        return local_path
 
-    headers = {"User-Agent": "streamlit-dashboard/1.0"}
+    headers = {"User-Agent": "render-streamlit-dashboard/1.0"}
 
-    try:
-        with st.spinner("Téléchargement du parquet (1ère fois)…"):
-            r = requests.get(PARQUET_URL, stream=True, headers=headers, timeout=180)
-            r.raise_for_status()
-            with open(LOCAL_PARQUET, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-        return LOCAL_PARQUET
-    except Exception as e:
-        st.error(f"Erreur téléchargement parquet: {e}")
-        raise
+    with st.spinner("Téléchargement du parquet (premier lancement)…"):
+        r = requests.get(url, stream=True, headers=headers, timeout=300)
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
+                if chunk:
+                    f.write(chunk)
+
+    return local_path
+
 
 @st.cache_data(show_spinner=True)
 def load_data() -> pd.DataFrame:
-    path = download_parquet()
+    path = download_parquet(PARQUET_URL, LOCAL_PARQUET)
 
-    try:
-        df = pd.read_parquet(path, columns=NEEDED_COLS)  # 🔥 hyper important
-    except Exception as e:
-        st.error(f"Erreur lecture parquet: {e}")
-        raise
+    # Lire uniquement les colonnes utiles (gros gain perf)
+    df = pd.read_parquet(path, columns=NEEDED_COLS)
 
-    # nettoyage minimal
-    df["mois_annee"] = pd.to_datetime(df["mois_annee"], errors="coerce")
-    df["mois"] = df["mois_annee"].dt.to_period("M").dt.to_timestamp()
+    # Nettoyage / colonnes calculées
+    df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+    df["mois"] = df[COL_DATE].dt.to_period("M").dt.to_timestamp()
 
-    df["presence_type_coord_03"] = (
-        pd.to_numeric(df["presence_type_coord_03"], errors="coerce")
-        .fillna(0).astype(int)
+    df[COL_PRESENCE] = (
+        pd.to_numeric(df[COL_PRESENCE], errors="coerce")
+        .fillna(0)
+        .astype(int)
     )
 
-    for col in ["CATEGORIE_LIBELLE_2", "CATEGORIE_LIBELLE_SSCAT"]:
-        if col in df.columns:
-            df[col] = df[col].astype("category")
+    # Perf
+    df[COL_CAT] = df[COL_CAT].astype("category")
+    df[COL_SSCAT] = df[COL_SSCAT].astype("category")
 
     return df
-
 
 
 df = load_data()
 
 
 # =========================
-# SIDEBAR FILTERS
+# Sidebar filtres
 # =========================
 st.sidebar.header("Filtres")
 
@@ -95,8 +103,8 @@ else:
     mois_range = None
 
 # Catégorie
-cat_options = sorted(pd.Series(df[COL_CAT]).dropna().astype(str).unique().tolist())
-if len(cat_options) == 0:
+cat_options = sorted(df[COL_CAT].dropna().astype(str).unique().tolist())
+if not cat_options:
     cat_options = ["Inconnu"]
 
 cat_filter = st.sidebar.multiselect(
@@ -124,7 +132,7 @@ cat_detail_pie = st.sidebar.selectbox(
 
 
 # =========================
-# FILTERING
+# Filtrage
 # =========================
 mask = pd.Series(True, index=df.index)
 
@@ -150,13 +158,13 @@ k4.metric("Nb mois (global)", int(df["mois"].nunique(dropna=True)))
 k5.metric("Nb avec type coordonnée 03 (OUI)", int(df[COL_PRESENCE].sum()))
 
 st.divider()
-st.info("✅ OUI : la redevabilité possède au moins une coordonnée de type 03 (adresse e-mail).")
-st.info("❌ NON : la redevabilité ne possède aucune coordonnée de type 03 (adresse e-mail).")
+st.info("OUI : la redevabilité possède au moins une coordonnée de type 03 (adresse e-mail).")
+st.info(" NON : la redevabilité ne possède aucune coordonnée de type 03 (adresse e-mail).")
 st.divider()
 
 
 # =========================
-# GRAPH 1 — Stacked bars + totals + % inside OUI
+# Graph 1 : stacked bar + total + % OUI dans OUI
 # =========================
 tmp = filtered.copy()
 
@@ -165,7 +173,6 @@ agg = (
     .agg(total="size", oui="sum")
     .reset_index()
 )
-
 agg["non"] = agg["total"] - agg["oui"]
 agg["Catégorie"] = agg[COL_CAT].astype(str).replace("nan", "Inconnu")
 agg = agg.sort_values("total", ascending=False)
@@ -234,7 +241,7 @@ st.plotly_chart(fig1, use_container_width=True)
 
 
 # =========================
-# GRAPH 2 — Drill-down sous-catégories (top 10)
+# Graph 2 : drill-down sous-catégories
 # =========================
 detail_df = filtered
 if cat_detail != "(Toutes)":
@@ -271,7 +278,7 @@ st.plotly_chart(fig2, use_container_width=True)
 
 
 # =========================
-# GRAPH 3 — Pie chart OUI/NON pour une catégorie
+# Graph 3 : pie chart OUI/NON pour une catégorie
 # =========================
 if cat_detail_pie == "(Choisir)":
     st.info("Choisis une catégorie dans le filtre 'Pie chart' pour afficher le graphique.")
