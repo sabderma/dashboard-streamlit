@@ -1,74 +1,70 @@
-import os
-import requests
 
-import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
 
-# =========================
-# CONFIG
-# =========================
-st.set_page_config(page_title="Dashboard — Redevabilité Catégories", layout="wide")
-st.title("Dashboard — Redevabilité (Catégories)")
+import os
+import requests
+import pandas as pd
+
 
 PARQUET_URL = "https://huggingface.co/datasets/sabderma/dashboard-streamlit-data/resolve/main/gd_redevabilite_enrichi.parquet"
-LOCAL_PARQUET = "gd_redevabilite_enrichi.parquet"
+LOCAL_PARQUET = "/tmp/gd_redevabilite_enrichi.parquet"  # important sur Streamlit Cloud
 
-COL_CAT = "CATEGORIE_LIBELLE_2"
-COL_SSCAT = "CATEGORIE_LIBELLE_SSCAT"
-COL_DATE = "mois_annee"
-COL_PRESENCE = "presence_type_coord_03"
+NEEDED_COLS = [
+    "mois_annee",
+    "CATEGORIE_LIBELLE_2",
+    "CATEGORIE_LIBELLE_SSCAT",
+    "presence_type_coord_03",
+]
 
-
-# =========================
-# DATA LOADER (download + cache)
-# =========================
 @st.cache_data(show_spinner=True)
-def _download_file(url: str, local_path: str) -> str:
-    """Download once (cached by Streamlit)."""
-    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-        return local_path
+def download_parquet() -> str:
+    # si déjà téléchargé
+    if os.path.exists(LOCAL_PARQUET) and os.path.getsize(LOCAL_PARQUET) > 0:
+        return LOCAL_PARQUET
 
-    with st.spinner("Téléchargement du fichier parquet (premier lancement)…"):
-        r = requests.get(url, stream=True, timeout=120)
-        r.raise_for_status()
-        with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
-                if chunk:
-                    f.write(chunk)
-    return local_path
+    headers = {"User-Agent": "streamlit-dashboard/1.0"}
 
+    try:
+        with st.spinner("Téléchargement du parquet (1ère fois)…"):
+            r = requests.get(PARQUET_URL, stream=True, headers=headers, timeout=180)
+            r.raise_for_status()
+            with open(LOCAL_PARQUET, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return LOCAL_PARQUET
+    except Exception as e:
+        st.error(f"Erreur téléchargement parquet: {e}")
+        raise
 
 @st.cache_data(show_spinner=True)
 def load_data() -> pd.DataFrame:
-    path = _download_file(PARQUET_URL, LOCAL_PARQUET)
+    path = download_parquet()
 
-    # Lecture parquet
-    df = pd.read_parquet(path)
+    try:
+        df = pd.read_parquet(path, columns=NEEDED_COLS)  # 🔥 hyper important
+    except Exception as e:
+        st.error(f"Erreur lecture parquet: {e}")
+        raise
 
-    # Sécuriser colonnes attendues
-    if COL_DATE in df.columns:
-        df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
-        df["mois"] = df[COL_DATE].dt.to_period("M").dt.to_timestamp()
-    else:
-        df["mois"] = pd.NaT
+    # nettoyage minimal
+    df["mois_annee"] = pd.to_datetime(df["mois_annee"], errors="coerce")
+    df["mois"] = df["mois_annee"].dt.to_period("M").dt.to_timestamp()
 
-    # présence_type_coord_03 => 0/1 int
-    if COL_PRESENCE in df.columns:
-        df[COL_PRESENCE] = pd.to_numeric(df[COL_PRESENCE], errors="coerce").fillna(0).astype(int)
-    else:
-        df[COL_PRESENCE] = 0
+    df["presence_type_coord_03"] = (
+        pd.to_numeric(df["presence_type_coord_03"], errors="coerce")
+        .fillna(0).astype(int)
+    )
 
-    # Categorical (perf)
-    for col in [COL_CAT, COL_SSCAT]:
+    for col in ["CATEGORIE_LIBELLE_2", "CATEGORIE_LIBELLE_SSCAT"]:
         if col in df.columns:
             df[col] = df[col].astype("category")
-        else:
-            df[col] = pd.Series(["Inconnu"] * len(df), dtype="category")
 
     return df
+
 
 
 df = load_data()
