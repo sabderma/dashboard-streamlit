@@ -1,6 +1,5 @@
 import os
 import requests
-
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -8,20 +7,19 @@ import plotly.graph_objects as go
 
 
 # =========================
-# Render config
+# CONFIG APP
 # =========================
 st.set_page_config(page_title="Dashboard — Redevabilité Catégories", layout="wide")
 st.title("Dashboard — Redevabilité (Catégories)")
 
 PARQUET_URL = "https://huggingface.co/datasets/sabderma/dashboard-streamlit-data/resolve/main/gd_redevabilite_enrichi.parquet"
 
-# Render: on stocke dans un dossier persistant (à monter sur Render)
+# Dossier persistant sur Render (monte un disk sur "data")
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-
 LOCAL_PARQUET = os.path.join(DATA_DIR, "gd_redevabilite_enrichi.parquet")
 
-# Colonnes utilisées par ton dashboard
+# Colonnes
 COL_CAT = "CATEGORIE_LIBELLE_2"
 COL_SSCAT = "CATEGORIE_LIBELLE_SSCAT"
 COL_DATE = "mois_annee"
@@ -31,31 +29,37 @@ NEEDED_COLS = [COL_DATE, COL_CAT, COL_SSCAT, COL_PRESENCE]
 
 
 # =========================
-# Download + Load
+# DOWNLOAD + LOAD
 # =========================
 @st.cache_data(show_spinner=True)
 def download_parquet(url: str, local_path: str) -> str:
+    """Télécharge le parquet une seule fois et le garde sur disque."""
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
         return local_path
 
     headers = {"User-Agent": "render-streamlit-dashboard/1.0"}
 
     with st.spinner("Téléchargement du parquet (premier lancement)…"):
-        r = requests.get(url, stream=True, headers=headers, timeout=300)
+        r = requests.get(url, stream=True, headers=headers, timeout=600)
         r.raise_for_status()
-        with open(local_path, "wb") as f:
+
+        tmp_path = local_path + ".part"
+        with open(tmp_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
                 if chunk:
                     f.write(chunk)
+
+        # Move final (évite fichier corrompu si crash)
+        os.replace(tmp_path, local_path)
 
     return local_path
 
 
 @st.cache_data(show_spinner=True)
 def load_data() -> pd.DataFrame:
+    """Charge le parquet (colonnes utiles seulement) + prépare les colonnes utilisées."""
     path = download_parquet(PARQUET_URL, LOCAL_PARQUET)
 
-    # Lire uniquement les colonnes utiles (gros gain perf)
     df = pd.read_parquet(path, columns=NEEDED_COLS)
 
     # Nettoyage / colonnes calculées
@@ -68,18 +72,42 @@ def load_data() -> pd.DataFrame:
         .astype(int)
     )
 
-    # Perf
-    df[COL_CAT] = df[COL_CAT].astype("category")
-    df[COL_SSCAT] = df[COL_SSCAT].astype("category")
+    # Optimisation mémoire
+    df[COL_CAT] = df[COL_CAT].astype("string")
+    df[COL_SSCAT] = df[COL_SSCAT].astype("string")
+
+    df[COL_CAT] = df[COL_CAT].fillna("Inconnu").astype("category")
+    df[COL_SSCAT] = df[COL_SSCAT].fillna("Inconnu").astype("category")
 
     return df
 
 
-df = load_data()
+# =========================
+# UI: bouton pour éviter crash au démarrage (anti-502)
+# =========================
+st.sidebar.header("Données")
+
+if "df" not in st.session_state:
+    st.session_state["df"] = None
+
+if st.sidebar.button("📥 Charger les données"):
+    try:
+        st.session_state["df"] = load_data()
+        st.sidebar.success("Données chargées ✅")
+    except Exception as e:
+        st.session_state["df"] = None
+        st.sidebar.error("Erreur pendant le chargement ❌")
+        st.exception(e)
+
+df = st.session_state["df"]
+
+if df is None:
+    st.info("Clique sur **📥 Charger les données** dans la barre à gauche pour démarrer.")
+    st.stop()
 
 
 # =========================
-# Sidebar filtres
+# SIDEBAR FILTRES
 # =========================
 st.sidebar.header("Filtres")
 
@@ -132,7 +160,7 @@ cat_detail_pie = st.sidebar.selectbox(
 
 
 # =========================
-# Filtrage
+# FILTRAGE
 # =========================
 mask = pd.Series(True, index=df.index)
 
@@ -159,12 +187,12 @@ k5.metric("Nb avec type coordonnée 03 (OUI)", int(df[COL_PRESENCE].sum()))
 
 st.divider()
 st.info("OUI : la redevabilité possède au moins une coordonnée de type 03 (adresse e-mail).")
-st.info(" NON : la redevabilité ne possède aucune coordonnée de type 03 (adresse e-mail).")
+st.info("NON : la redevabilité ne possède aucune coordonnée de type 03 (adresse e-mail).")
 st.divider()
 
 
 # =========================
-# Graph 1 : stacked bar + total + % OUI dans OUI
+# GRAPH 1 — stacked bar + total + % OUI
 # =========================
 tmp = filtered.copy()
 
@@ -173,6 +201,7 @@ agg = (
     .agg(total="size", oui="sum")
     .reset_index()
 )
+
 agg["non"] = agg["total"] - agg["oui"]
 agg["Catégorie"] = agg[COL_CAT].astype(str).replace("nan", "Inconnu")
 agg = agg.sort_values("total", ascending=False)
@@ -241,7 +270,7 @@ st.plotly_chart(fig1, use_container_width=True)
 
 
 # =========================
-# Graph 2 : drill-down sous-catégories
+# GRAPH 2 — drill-down sous-catégories (top 10)
 # =========================
 detail_df = filtered
 if cat_detail != "(Toutes)":
@@ -274,11 +303,12 @@ fig2.update_layout(
     uniformtext_minsize=10,
     uniformtext_mode="hide"
 )
+
 st.plotly_chart(fig2, use_container_width=True)
 
 
 # =========================
-# Graph 3 : pie chart OUI/NON pour une catégorie
+# GRAPH 3 — pie chart OUI/NON pour une catégorie
 # =========================
 if cat_detail_pie == "(Choisir)":
     st.info("Choisis une catégorie dans le filtre 'Pie chart' pour afficher le graphique.")
